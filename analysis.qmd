@@ -1,0 +1,171 @@
+---
+title: "SC Election Trends Analysis"
+format: html
+---
+
+```{r}
+# load packages and data
+
+library(tidyverse)
+library(readr)
+library(readxl)
+library(stringr)
+library(sf)
+library(tigris)
+library(scales)
+library(patchwork)
+library(tidygeocoder)
+
+
+gov_senate_2026_xlsx <- "data/2026_gov_senate.xlsx"
+
+excel_sheets(gov_senate_2026_xlsx)[1:10] # sheet 9 = senate, sheet 2 = governor
+
+```
+
+```{r}
+# Separate 2026 senate and gov into 2 dfs
+
+party_names <- c(REP = "Republican", DEM = "Democratic", LIB = "Libertarian",
+                 CON = "Constitution", GRN = "Green", UNC = "United Citizens")
+
+# ---- 1. Read both contest sheets into one long table -------------------------
+# Each candidate gets a 7-column block (Election Day, Early Voting, Absentee,
+# Failsafe, Provisional, Failsafe Provisional, Total Votes). We only keep
+# each block's "Total Votes" column.
+
+raw_2026 <- c(senate = "9", governor = "2") |>
+  map(\(s) read_excel(gov_senate_2026_xlsx, sheet = s, col_names = FALSE, col_types = "text",
+                      .name_repair = "unique_quiet")) |>
+  list_rbind(names_to = "race") |>
+  group_by(race) |>
+  mutate(row = row_number()) |>
+  ungroup()
+
+cells_2026 <- raw_2026 |>
+  pivot_longer(starts_with("..."), names_to = "col", values_to = "value") |>
+  mutate(col_num = as.integer(str_remove(col, "...")))  # "...5" -> 5
+
+# Candidate label sits in row 2 (merged across the block), field name in row 3
+columns_2026 <- cells_2026 |>
+  filter(row %in% 2:3) |>
+  select(race, col_num, row, value) |>
+  pivot_wider(names_from = row, values_from = value, names_prefix = "row") |>
+  arrange(race, col_num) |>
+  group_by(race) |>
+  fill(row2) |>
+  ungroup() |>
+  filter(row3 == "Total Votes") |>
+  mutate(
+    party_code = str_extract(row2, "^[A-Z]{3}(?= )"),
+    party      = party_names[party_code],
+    candidate  = str_remove(row2, "^[A-Z]{3} "),
+    candidate  = if_else(is.na(party), candidate, str_c(candidate, " (", party, ")"))
+  ) |>
+  select(race, col_num, candidate, party)
+
+
+columns_2026   # 5 candidate columns per race, including Write-In
+
+# County names are in column 1 for rows 4 onward; the last row is "Total:"
+names_2026 <- cells_2026 |>
+  filter(row >= 4, col_num == 1) |>
+  select(race, row, county = value)
+
+votes_2026 <- cells_2026 |>
+  filter(row >= 4) |>
+  inner_join(columns_2026, by = c("race", "col_num")) |>
+  left_join(names_2026, by = c("race", "row")) |>
+  mutate(
+    level  = if_else(county == "Total:", "State", "County"),
+    county = if_else(county == "Total:", "South Carolina", county),
+    votes  = as.numeric(value)
+  ) |>
+  select(race, level, county, candidate, party, votes)
+
+# The workbook's own "Total" column (last column), used to QA our sums
+xlsx_totals <- cells_2026 |>
+  filter(row >= 4, col_num == max(col_num)) |>
+  left_join(names_2026, by = c("race", "row")) |>
+  mutate(county = if_else(county == "Total:", "South Carolina", county),
+         xlsx_total = as.numeric(value)) |>
+  select(race, county, xlsx_total)
+
+# ---- 2. Ballots cast and registered voters (Registered Voters sheet) ---------
+# The contest sheets have no ballots-cast or over/undervote column, so
+# Total Ballots Cast comes from this sheet and Overvotes/Undervotes is derived
+# as ballots cast minus votes cast in the race.
+
+registration_2026 <- read_excel(gov_senate_2026_xlsx, sheet = "Registered Voters") |>
+  rename(county = County, registered = `Registered Voters`,
+         ballots = `Ballots Cast`, turnout_pct = `Voter Turnout`) |>
+  mutate(county = if_else(county == "Total:", "South Carolina", county),
+         turnout_pct = parse_number(turnout_pct))
+
+# ---- 3. Wide tables in the same layout as the older CSVs ---------------------
+# Column order follows the old files: Republican, Democratic, other parties
+# (by statewide vote), Write-In last.
+
+candidate_order <- votes_2026 |>
+  filter(level == "State") |>
+  arrange(race, party != "Republican", party != "Democratic",
+          is.na(party), desc(votes))
+
+senate_order   <- candidate_order |> filter(race == "senate")   |> pull(candidate)
+governor_order <- candidate_order |> filter(race == "governor") |> pull(candidate)
+
+wide_2026 <- votes_2026 |>
+  select(-party) |>
+  pivot_wider(names_from = candidate, values_from = votes) |>
+  left_join(xlsx_totals, by = c("race", "county")) |>
+  left_join(select(registration_2026, county, ballots), by = "county") |>
+  mutate(`Total Votes Cast`     = xlsx_total,
+         `Overvotes/Undervotes` = ballots - xlsx_total,
+         `Total Ballots Cast`   = ballots) |>
+  arrange(race, level != "State")      # State row first, like the old files
+
+senate_2026 <- wide_2026 |>
+  filter(race == "senate") |>
+  select(level, county, all_of(senate_order),
+         `Total Votes Cast`, `Overvotes/Undervotes`, `Total Ballots Cast`)
+
+governor_2026 <- wide_2026 |>
+  filter(race == "governor") |>
+  select(level, county, all_of(governor_order),
+         `Total Votes Cast`, `Overvotes/Undervotes`, `Total Ballots Cast`)
+
+senate_2026
+governor_2026
+
+# ---- 4. QA checks ------------------------------------------------------------
+
+# 46 counties plus one State row in each table
+stopifnot(nrow(senate_2026) == 47, nrow(governor_2026) == 47)
+
+# Candidate votes add up to the workbook's Total column in every row
+votes_2026 |>
+  group_by(race, county) |>
+  summarise(sum_of_candidates = sum(votes), .groups = "drop") |>
+  left_join(xlsx_totals, by = c("race", "county")) |>
+  filter(sum_of_candidates != xlsx_total)          # expect 0 rows
+
+# County rows add up to the State row
+votes_2026 |>
+  group_by(race, candidate, level) |>
+  summarise(votes = sum(votes), .groups = "drop") |>
+  pivot_wider(names_from = level, values_from = votes) |>
+  filter(County != State)                          # expect 0 rows
+
+# No county has more votes in a race than ballots cast
+bind_rows(senate = senate_2026, governor = governor_2026, .id = "race") |>
+  filter(`Overvotes/Undervotes` < 0)               # expect 0 rows
+
+# Registered voters in the contest sheets match the Registered Voters sheet
+cells_2026 |>
+  filter(row >= 4, col_num == 2) |>
+  left_join(names_2026, by = c("race", "row")) |>
+  mutate(county = if_else(county == "Total:", "South Carolina", county)) |>
+  left_join(registration_2026, by = "county") |>
+  filter(as.numeric(value) != registered)          # expect 0 rows
+
+```
