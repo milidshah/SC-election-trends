@@ -234,7 +234,7 @@ vote_shares <- results |>
 vote_shares |> filter(level=="State")
  
 
-# ---- 3. County shapes and the join -------------------------------------------
+# join on county name, incorporate county shapes
 # Census cartographic boundary file (generalized, clipped to the shoreline).
 # Join on county name after lower-casing and dropping spaces/punctuation,
 # so "McCormick" / "Mccormick" or "St. X" style differences can't break it.
@@ -258,7 +258,7 @@ map_data <- sc_counties |>
 map_data |> st_drop_geometry() |> count(race)
 stopifnot(nrow(map_data) == 46 * 4, n_distinct(map_data$GEOID) == 46)
 
-# ---- 4. Maps -----------------------------------------------------------------
+# maps
 # Diverging red-white-blue centered at 50%. The same limits are used on every
 # map so a given shade means the same share in every race.
 
@@ -278,7 +278,7 @@ four_panel <- ggplot(map_data) +
   facet_wrap(~race, ncol = 2) +
   labs(
     title = "South Carolina: Democratic minus Republican vote share by county",
-    caption = "Shares are of all votes cast in the race, including third parties and write-ins. 2026 results are unofficial.\nSource: S.C. Election Commission; county boundaries: U.S. Census Bureau (tigris)."
+    caption = "Shares are of all votes cast in the race, including third parties and write-ins.\nSource: S.C. Election Commission; county boundaries: U.S. Census Bureau (tigris)."
   ) +
   theme_void(base_size = 11) +
   theme(strip.text = element_text(face = "bold", size = 11),
@@ -311,7 +311,7 @@ map_2026_governor <- ggplot(filter(map_data, race == "2026 Governor")) +
   geom_sf(aes(fill = margin), color = "white", linewidth = 0.2) +
   share_fill +
   labs(title = "2026 Governor: Wilson (R) vs. Johnson (D)",
-       caption = "Unofficial results. Source: S.C. Election Commission; U.S. Census Bureau.") +
+       caption = "Official results. Source: S.C. Election Commission; U.S. Census Bureau.") +
   theme_void() +
   theme(plot.title = element_text(face = "bold"),
         plot.caption = element_text(hjust = 0, color = "grey40"))
@@ -320,7 +320,7 @@ map_2026_senate <- ggplot(filter(map_data, race == "2026 Senate")) +
   geom_sf(aes(fill = margin), color = "white", linewidth = 0.2) +
   share_fill +
   labs(title = "2026 U.S. Senate: Graham (R) vs. Andrews (D)",
-       caption = "Unofficial results. Source: S.C. Election Commission; U.S. Census Bureau.") +
+       caption = "Official results. Source: S.C. Election Commission; U.S. Census Bureau.") +
   theme_void() +
   theme(plot.title = element_text(face = "bold"),
         plot.caption = element_text(hjust = 0, color = "grey40"))
@@ -469,7 +469,7 @@ turnout_chart <- turnout_summary |>
                      expand = expansion(mult = c(0, 0.1))) +
   labs(title = "South Carolina: total ballots cast, 2020-2026",
        x = NULL, y = "Ballots cast",
-       caption = "2026 results are unofficial. Source: S.C. Election Commission.") +
+       caption = "2026 results are Official. Source: S.C. Election Commission.") +
   theme_minimal(base_size = 11) +
   theme(panel.grid.major.x = element_blank(),
         plot.title = element_text(face = "bold"),
@@ -518,6 +518,7 @@ margins <- bind_rows(results_2022, results_2026) |>
     dem_votes   = sum(votes[party %in% "Democratic"]),
     rep_votes   = sum(votes[party %in% "Republican"]),
     total_votes = sum(votes[candidate == "Total Votes Cast"]),
+    ballots     = sum(votes[candidate == "Total Ballots Cast"]),
     .groups = "drop"
   ) |>
   mutate(margin = (dem_votes - rep_votes) / total_votes)
@@ -529,20 +530,100 @@ county_shifts <- margins |>
   select(county, race, margin) |>
   pivot_wider(names_from = race, values_from = margin, names_prefix = "margin_") |>
   left_join(
-    margins |> filter(race == "2026 Senate") |> select(county, votes_2026 = total_votes),
+    margins |> filter(race == "2026 Senate") |> select(county, votes_2026 = total_votes,
+                                                       ballots_2026 = ballots),
+    by = "county"
+  ) |>
+  left_join(
+    margins |> filter(race == "2022 Senate") |> select(county, ballots_2022 = ballots),
     by = "county"
   ) |>
   mutate(
-    split        = margin_2026_senate - margin_2026_governor,
-    senate_swing = margin_2026_senate - margin_2022_senate,
-    gov_swing    = margin_2026_governor - margin_2022_governor
+    split          = margin_2026_senate - margin_2026_governor,
+    senate_swing   = margin_2026_senate - margin_2022_senate,
+    gov_swing      = margin_2026_governor - margin_2022_governor,
+    ballots_change = ballots_2026 / ballots_2022 - 1    # % change in ballots cast
   )
 
 stopifnot(nrow(county_shifts) == 46, !anyNA(county_shifts))
 
 county_shifts |> arrange(desc(split)) |> print(n = 46)
 
-# ---- 3. County context: ACS college share and USDA RUCC ----------------------
+# Swing in both races, long format, used by charts 2 and 3
+swing_long <- county_shifts |>
+  select(county, votes_2026, ballots_change, senate_swing, gov_swing) |>
+  pivot_longer(c(senate_swing, gov_swing), names_to = "race", values_to = "swing") |>
+  mutate(race = recode(race,
+                       senate_swing = 
+                         "Senate: Scott (R) vs. Matthews (D) 2022 to Graham (R) vs. Andrews (D) 2026",
+                       gov_swing = 
+                         "Governor: McMaster (R) vs. Cunningham (D) 2022 to Wilson (R) vs. Johnson (D) 2026"),
+         race = str_wrap(race, 45))
+
+
+# ---- 3. Chart 1: split-ticket scatter ----------------------------------------
+# Points above the dashed line: Andrews (D) did better than Johnson (D) there.
+
+label_counties <- county_shifts |>
+  filter(rank(desc(votes_2026)) <= 8 | rank(desc(split)) <= 5)   # biggest cts + biggest splts
+
+split_scatter <- ggplot(county_shifts, aes(x = margin_2026_governor, y = margin_2026_senate)) +
+  geom_hline(yintercept = 0, color = "grey80") +
+  geom_vline(xintercept = 0, color = "grey80") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
+  geom_point(aes(size = votes_2026), shape = 21, fill = "#4A6FA5", color = "white", alpha = 0.8) +
+  geom_text_repel(data = label_counties, aes(label = county),
+                  size = 3, min.segment.length = 0, seed = 1) +
+  scale_x_continuous(labels = scales::label_percent(style_positive = "plus")) +
+  scale_y_continuous(labels = scales::label_percent(style_positive = "plus")) +
+  scale_size_area(max_size = 14, labels = scales::comma, name = "2026 votes") +
+  coord_equal() +
+  labs(
+    title = "2026 Senate vs. governor margin by county",
+    subtitle = "Margin = Dem share minus Rep share. Above the dashed line = Senate Democrat did better.",
+    x = "Governor margin (Wilson R vs. Johnson D)",
+    y = "Senate margin (Graham R vs. Andrews D)",
+    caption = "Official results. Source: S.C. Election Commission."
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"),
+        plot.caption = element_text(hjust = 0, color = "grey40"),
+        panel.grid.minor = element_blank())
+
+split_scatter
+
+
+# ---- 4. Chart 2: swing vs. change in ballots cast ----------------------------
+
+swing_long |>
+  group_by(race) |>
+  summarise(correlation = cor(ballots_change, swing))
+
+summary(lm(senate_swing ~ ballots_change, data = county_shifts))
+summary(lm(gov_swing ~ ballots_change, data = county_shifts))
+# Slope = change in swing per 1.00 (100%) change in ballots cast;
+# divide by 10 for "per 10% more ballots".
+
+swing_turnout <- ggplot(swing_long, aes(x = ballots_change, y = swing)) +
+  geom_point(aes(size = votes_2026), shape = 21, fill = "#4A6FA5", color = "white", alpha = 0.8) +
+  geom_smooth(method = "lm", formula = y ~ x, se = FALSE, color = "grey30", linewidth = 0.6) +
+  facet_wrap(~race) +
+  scale_x_continuous(labels = scales::label_percent(style_positive = "plus")) +
+  scale_y_continuous(labels = scales::label_percent(style_positive = "plus")) +
+  scale_size_area(max_size = 10, guide = "none") +
+  labs(title = "Swing toward Democrats vs. change in ballots cast, 2022 to 2026",
+       x = "Change in total ballots cast, 2022 to 2026",
+       y = "Swing in margin, 2022 to 2026",
+       caption = paste("Ballots cast stand in for turnout: registered-voter counts are available for 2026 only.",
+                       "Official 2026 results. Source: S.C. Election Commission.", sep = "\n")) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"),
+        plot.caption = element_text(hjust = 0, color = "grey40"))
+
+swing_turnout
+
+
+# ---- 5. Chart 3: swing vs. college share (ACS) -------------------------------
 
 # ACS 2019-2023 5-year, table B15003 (educational attainment, population 25+).
 # Bachelor's or higher = bachelor's (022) + master's (023) + professional (024)
@@ -560,190 +641,350 @@ college <- acs_education |>
   mutate(county = str_remove(NAME, " County, South Carolina")) |>
   select(fips, county, college_share)
 
-# USDA ERS 2023 Rural-Urban Continuum Codes, long format:
-# FIPS, State, County_Name, Attribute (Population_2020 / RUCC_2023 / Description), Value
-# Page: https://www.ers.usda.gov/data-products/rural-urban-continuum-codes
-# If the download is blocked, save the CSV to data/raw/ and read it from there.
-rucc <- read_csv("https://ers.usda.gov/media/5768/2023-rural-urban-continuum-codes.csv",
-                 col_types = cols(.default = "c")) |>
-  filter(State == "SC", Attribute %in% c("RUCC_2023", "Population_2020")) |>
-  select(fips = FIPS, Attribute, Value) |>
-  pivot_wider(names_from = Attribute, values_from = Value) |>
-  transmute(fips, rucc = as.integer(RUCC_2023), pop_2020 = as.numeric(Population_2020))
+swing_college_data <- swing_long |>
+  left_join(college, by = "county")
 
-# Urban / suburban / rural rule
-#   rural    = nonmetro county (RUCC 4-9)
-#   urban    = metro county (RUCC 1-3) that holds the main city of its own metro
-#              area. Edit this list if you draw the line differently.
-#   suburban = every other metro county: the ring counties around those cores,
-#              plus SC counties in metros centered out of state
-#              (Charlotte: York, Lancaster; Augusta: Aiken, Edgefield).
-urban_cores <- c(
-  "Richland",     # Columbia
-  "Charleston",   # Charleston-North Charleston
-  "Greenville",   # Greenville-Anderson
-  "Spartanburg",  # Spartanburg
-  "Horry",        # Myrtle Beach
-  "Florence",     # Florence
-  "Sumter",       # Sumter
-  "Beaufort"      # Hilton Head Island-Bluffton
+stopifnot(!anyNA(swing_college_data$college_share))   # all 46 counties matched
+
+swing_college_data |>
+  group_by(race) |>
+  summarise(correlation = cor(college_share, swing))
+
+summary(lm(senate_swing ~ college_share, data = left_join(county_shifts, college, by = "county")))
+summary(lm(gov_swing ~ college_share, data = left_join(county_shifts, college, by = "county")))
+# Slope = change in swing per 1.00 change in college share; divide by 10 for
+# "per 10 points of college share".
+
+swing_college <- ggplot(swing_college_data, aes(x = college_share, y = swing)) +
+  geom_point(aes(size = votes_2026), shape = 21, fill = "#4A6FA5", color = "white", alpha = 0.8) +
+  geom_smooth(method = "lm", formula = y ~ x, se = FALSE, color = "grey30", linewidth = 0.6) +
+  facet_wrap(~race) +
+  scale_x_continuous(labels = scales::percent) +
+  scale_y_continuous(labels = scales::label_percent(style_positive = "plus")) +
+  scale_size_area(max_size = 10, guide = "none") +
+  labs(title = "Swing toward Democrats vs. college share",
+       x = "Adults 25+ with a bachelor's degree or higher (ACS 2019-2023)",
+       y = "Swing in margin, 2022 to 2026",
+       caption = "Official 2026 results. Source: S.C. Election Commission; U.S. Census Bureau ACS.") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"),
+        plot.caption = element_text(hjust = 0, color = "grey40"))
+
+swing_college
+
+# ---- 5b. Chart 3b: 2026 margin vs. college share (ACS) -----------------------
+
+margin_long <- county_shifts |>
+  select(county, votes_2026, margin_2026_senate, margin_2026_governor) |>
+  pivot_longer(c(margin_2026_senate, margin_2026_governor), names_to = "race", values_to = "margin") |>
+  mutate(race = recode(race,
+                       margin_2026_senate   = "2026 Senate: Graham (R) vs. Andrews (D)",
+                       margin_2026_governor = "2026 Governor: Wilson (R) vs. Johnson (D)"),
+         race = fct_relevel(race, "2026 Senate: Graham (R) vs. Andrews (D)"))
+
+margin_college_data <- margin_long |>
+  left_join(college, by = "county")
+
+stopifnot(!anyNA(margin_college_data$college_share), nrow(margin_college_data) == 92)
+
+margin_college_data |>
+  group_by(race) |>
+  summarise(correlation = cor(college_share, margin))
+
+summary(lm(margin_2026_senate ~ college_share, data = left_join(county_shifts, college, by = "county")))
+summary(lm(margin_2026_governor ~ college_share, data = left_join(county_shifts, college, by = "county")))
+
+margin_college <- ggplot(margin_college_data, aes(x = college_share, y = margin)) +
+  geom_hline(yintercept = 0, color = "grey80") +
+  geom_point(aes(size = votes_2026), shape = 21, fill = "#4A6FA5", color = "white", alpha = 0.8) +
+  geom_smooth(method = "lm", formula = y ~ x, se = FALSE, color = "grey30", linewidth = 0.6) +
+  facet_wrap(~race) +
+  scale_x_continuous(labels = scales::percent) +
+  scale_y_continuous(labels = scales::label_percent(style_positive = "plus")) +
+  scale_size_area(max_size = 10, guide = "none") +
+  labs(title = "2026 county margin vs. college share",
+       subtitle = "Margin = Dem share minus Rep share of all votes. Above zero = Democrat ahead.",
+       x = "Adults 25+ with a bachelor's degree or higher (ACS 2019-2023)",
+       y = "Margin, 2026",
+       caption = "Official 2026 results. Source: S.C. Election Commission; U.S. Census Bureau ACS.") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"),
+        plot.caption = element_text(hjust = 0, color = "grey40"))
+
+margin_college
+
+# 6. Dumbbell ------------------------------------------
+dumbbell_data <- margins |>
+  separate(race, into = c("year", "office"), sep = " ") |>
+  filter(office %in% c("Senate", "Governor")) |>          # NEW: drop president rows
+  mutate(office = recode(office,
+                         Senate   = "Senate\n2022 Scott (R) vs. Matthews (D)\n2026 Graham (R) vs. Andrews (D)",
+                         Governor = "Governor\n2022 McMaster (R) vs. Cunningham (D)\n2026 Wilson (R) vs. Johnson (D)"))
+
+# Sort counties by 2026 Senate margin (most Democratic at top)
+county_order <- county_shifts |> arrange(margin_2026_senate) |> pull(county)
+
+dumbbell_data <- dumbbell_data |>
+  mutate(county = factor(county, levels = county_order),
+         office = fct_rev(office))   # Senate panel on the left
+
+margin_dumbbell <- ggplot(dumbbell_data, aes(x = margin, y = county)) +
+  geom_vline(xintercept = 0, color = "grey60") +
+  geom_line(aes(group = county), color = "grey75", linewidth = 0.7) +
+  geom_point(aes(color = year), size = 2) +
+  facet_wrap(~office) +
+  scale_x_continuous(labels = scales::label_percent(style_positive = "plus")) +
+  scale_color_manual(values = c("2022" = "#B8B8B8", "2026" = "#2F4B7C"), name = NULL) +
+  labs(
+    title = "County margins, 2022 vs. 2026",
+    subtitle = "Margin = Dem share minus Rep share of all votes. Left of zero = Republican ahead.",
+    x = "Margin", y = NULL,
+    caption = "Counties sorted by 2026 Senate margin. Source: S.C. Election Commission."
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(plot.title = element_text(face = "bold"),
+        plot.caption = element_text(hjust = 0, color = "grey40"),
+        strip.text = element_text(face = "bold", hjust = 0),
+        panel.spacing.x = unit(2, "lines"),
+        legend.position = "top",
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor = element_blank())
+
+margin_dumbbell
+
+# 7. Ballots Cast - aka voter turnout 2022 vs 2026
+# ---- 6. Chart 4: ballots cast, 2022 vs. 2026 ---------------------------------
+
+statewide_ballots <- county_shifts |>
+  summarise(ballots_2022 = sum(ballots_2022), ballots_2026 = sum(ballots_2026)) |>
+  mutate(ballots_change = ballots_2026 / ballots_2022 - 1)
+
+statewide_ballots     # 1,718,626 -> 2,054,835
+
+ballots_bars_data <- county_shifts |>
+  slice_max(ballots_2026, n = 10) |>
+  mutate(county = fct_reorder(county, ballots_2026)) |>
+  select(county, ballots_2022, ballots_2026, ballots_change) |>
+  pivot_longer(c(ballots_2022, ballots_2026), names_to = "year", values_to = "ballots") |>
+  mutate(year = str_remove(year, "ballots_"))
+
+ballots_labels <- ballots_bars_data |> filter(year == "2026")   # one % label per county
+
+ballots_bars <- ggplot(ballots_bars_data, aes(x = ballots, y = county, fill = year)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+  geom_text(data = ballots_labels,
+            aes(label = scales::percent(ballots_change, accuracy = 1, style_positive = "plus")),
+            hjust = -0.15, size = 3, nudge_y = 0.18) +
+  scale_x_continuous(labels = scales::comma, expand = expansion(mult = c(0, 0.12))) +
+  scale_fill_manual(values = c("2022" = "#B8B8B8", "2026" = "#2F4B7C"), name = NULL) +
+  labs(
+    title = "Ballots cast, 2022 vs. 2026: 10 largest counties",
+    subtitle = str_glue("Statewide: {scales::comma(statewide_ballots$ballots_2022)} in 2022, ",
+                        "{scales::comma(statewide_ballots$ballots_2026)} in 2026 ",
+                        "({scales::percent(statewide_ballots$ballots_change, accuracy = 0.1, style_positive = 'plus')}). ",
+                        "Labels show the change."),
+    x = "Total ballots cast", y = NULL,
+    caption = "Official 2026 results. Source: S.C. Election Commission."
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"),
+        plot.caption = element_text(hjust = 0, color = "grey40"),
+        legend.position = "top",
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor = element_blank())
+
+ballots_bars
+
+```
+
+```{r}
+# compare blue wave turnout margins in SC
+
+
+files <- c(
+  "2014" = "data/2014_gov.csv",
+  "2018" = "data/2018_gov.csv",
+  "2022" = "data/2022_gov.csv"
 )
 
-county_context <- college |>
-  left_join(rucc, by = "fips") |>
+raw <- files |>
+  map(\(f) read_csv(f, col_names = FALSE, col_types = cols(.default = "c"))) |>
+  list_rbind(names_to = "year") |>
+  group_by(year) |>
+  mutate(row = row_number()) |>
+  ungroup()
+
+column_labels <- raw |>
+  filter(row %in% 1:2) |>
+  pivot_longer(-c(year, row, X1, X2), names_to = "col", values_to = "value") |>
+  select(year, row, col, value) |>
+  pivot_wider(names_from = row, values_from = value, names_prefix = "row") |>
+  rename(candidate = row1, party = row2) |>
+  filter(!is.na(candidate))
+
+column_labels |> print(n = 30)    # check each year's Dem and Rep columns are labeled
+
+results_old <- raw |>
+  filter(X1 == "County") |>
+  rename(county = X2) |>
+  pivot_longer(-c(year, row, X1, county), names_to = "col", values_to = "votes") |>
+  inner_join(column_labels, by = c("year", "col")) |>
+  mutate(votes = as.numeric(votes)) |>
+  select(year, county, candidate, party, votes)
+
+results_2026 <- governor_2026 |>
+  filter(level == "County") |>
+  pivot_longer(-c(level, county), names_to = "candidate", values_to = "votes") |>
+  mutate(year = "2026",
+         party = str_extract(candidate, "(?<=\\()[^)]+(?=\\)$)")) |>   # "(Democratic)" -> Democratic
+  select(year, county, candidate, party, votes)
+
+governor <- bind_rows(results_old, results_2026) |>
+  group_by(year, county) |>
+  summarise(
+    dem_votes   = sum(votes[party %in% "Democratic"]),
+    rep_votes   = sum(votes[party %in% "Republican"]),
+    total_votes = sum(votes[candidate == "Total Votes Cast"]),
+    ballots     = sum(votes[candidate == "Total Ballots Cast"]),
+    .groups = "drop"
+  ) |>
+  mutate(margin = (dem_votes - rep_votes) / total_votes)
+
+# Checks: 46 counties in every year, and every county has Dem and Rep votes
+governor |> count(year)                                          # expect 46 each
+governor |> filter(dem_votes == 0 | rep_votes == 0 | ballots == 0)   # expect 0 rows
+
+# ---- 2. Statewide summary table ----------------------------------------------
+
+statewide <- governor |>
+  group_by(year) |>
+  summarise(across(c(dem_votes, rep_votes, total_votes, ballots), sum)) |>
   mutate(
-    county_type = case_when(
-      rucc >= 4                 ~ "Rural",
-      county %in% urban_cores   ~ "Urban",
-      TRUE                      ~ "Suburban"
-    ),
-    county_type = factor(county_type, levels = c("Urban", "Suburban", "Rural"))
+    margin         = (dem_votes - rep_votes) / total_votes,
+    swing          = margin - lag(margin),            # 2018 vs 2014, 2026 vs 2022 (rows 2 and 4)
+    ballots_change = ballots / lag(ballots) - 1,
+    swing          = if_else(year %in% c("2018", "2026"), swing, NA),
+    ballots_change = if_else(year %in% c("2018", "2026"), ballots_change, NA)
   )
 
-# Check: 46 counties, every one has a RUCC code, and the urban list has no typos
-stopifnot(nrow(county_context) == 46, !anyNA(county_context$rucc))
-setdiff(urban_cores, county_context$county)                     # expect character(0)
-county_context |> filter(county %in% urban_cores, rucc >= 4)    # expect 0 rows
+statewide |> print(width = Inf)
 
-county_context |> count(county_type)
-county_context |> arrange(county_type, rucc) |> print(n = 46)
+# ---- 3. County swing and ballots change for each wave ------------------------
 
-analysis <- county_shifts |>
-  left_join(county_context, by = "county")
+waves <- governor |>
+  select(year, county, margin, ballots) |>
+  pivot_wider(names_from = year, values_from = c(margin, ballots)) |>
+  mutate(
+    swing_2018          = margin_2018 - margin_2014,
+    swing_2026          = margin_2026 - margin_2022,
+    ballots_change_2018 = ballots_2018 / ballots_2014 - 1,
+    ballots_change_2026 = ballots_2026 / ballots_2022 - 1
+  )
 
-stopifnot(!anyNA(analysis$fips))   # every results county matched a FIPS code
+stopifnot(nrow(waves) == 46, !anyNA(waves))
 
-# ---- 4. Summary tables -------------------------------------------------------
+waves |> select(county, swing_2018, swing_2026) |> arrange(desc(swing_2026)) |> print(n = 46)
 
-# Average swing and split by county type: simple county average, and weighted
-# by 2026 Senate votes (closer to what each group contributed statewide)
-swing_by_type <- analysis |>
-  group_by(county_type) |>
+waves |>
   summarise(
-    counties              = n(),
-    mean_senate_swing     = mean(senate_swing),
-    mean_gov_swing        = mean(gov_swing),
-    mean_split            = mean(split),
-    weighted_senate_swing = weighted.mean(senate_swing, votes_2026),
-    weighted_gov_swing    = weighted.mean(gov_swing, votes_2026),
-    weighted_split        = weighted.mean(split, votes_2026),
-    total_votes_2026      = sum(votes_2026)
+    counties_bigger_swing_2026   = sum(swing_2026 > swing_2018),
+    counties_more_ballots_growth = sum(ballots_change_2026 > ballots_change_2018),
+    cor_swings                   = cor(swing_2018, swing_2026)
   )
 
-swing_by_type |> print(width = Inf)
+# Label the largest counties plus the ones furthest from the diagonal
+label_swing <- waves |>
+  filter(rank(desc(ballots_2026)) <= 8 | rank(desc(abs(swing_2026 - swing_2018))) <= 5)
 
-# How swing and split track with college share (one row per measure)
-analysis |>
-  summarise(
-    cor_senate_swing = cor(college_share, senate_swing),
-    cor_gov_swing    = cor(college_share, gov_swing),
-    cor_split        = cor(college_share, split)
-  )
+# ---- 4. Chart 1: county governor swing, 2018 wave vs. 2026 wave --------------
 
-senate_swing_model <- lm(senate_swing ~ college_share, data = analysis)
-gov_swing_model    <- lm(gov_swing ~ college_share, data = analysis)
-split_model        <- lm(split ~ college_share, data = analysis)
-
-summary(senate_swing_model)
-summary(gov_swing_model)
-summary(split_model)
-# Slope reads as: change in margin (in share points) per 1.00 change in college
-# share; divide by 10 for "per 10 points of college share".
-
-# ---- 5. Main chart: split-ticket scatter -------------------------------------
-# Points above the dashed line: Andrews (D) did better than Johnson (D) there.
-
-label_counties <- analysis |>
-  filter(county_type == "Suburban" | rank(desc(abs(split))) <= 5)
-
-split_scatter <- ggplot(analysis, aes(x = margin_2026_governor, y = margin_2026_senate)) +
+swing_scatter <- ggplot(waves, aes(x = swing_2018, y = swing_2026)) +
   geom_hline(yintercept = 0, color = "grey80") +
   geom_vline(xintercept = 0, color = "grey80") +
   geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
-  geom_point(aes(size = votes_2026, fill = county_type),
-             shape = 21, color = "white", alpha = 0.85) +
-  geom_text_repel(data = label_counties, aes(label = county),
-                  size = 3, min.segment.length = 0, seed = 1) +
+  geom_point(aes(size = ballots_2026), shape = 21, fill = "#4A6FA5", color = "white", alpha = 0.8) +
+  geom_text_repel(data = label_swing, aes(label = county), size = 3, min.segment.length = 0, seed = 1) +
   scale_x_continuous(labels = scales::label_percent(style_positive = "plus")) +
   scale_y_continuous(labels = scales::label_percent(style_positive = "plus")) +
-  scale_size_area(max_size = 14, labels = scales::comma, name = "2026 votes") +
-  scale_fill_manual(values = c(Urban = "#4A6FA5", Suburban = "#E08E45", Rural = "#7A9A65"),
-                    name = NULL) +
-  guides(fill = guide_legend(override.aes = list(size = 4)),
-         size = guide_legend(override.aes = list(fill = "grey60"))) +
-  coord_equal() +
+  scale_size_area(max_size = 12, labels = scales::comma, name = "2026 ballots") +
   labs(
-    title = "2026 Senate vs. governor margin by county",
-    subtitle = "2026 margin by county (Dem share minus Rep share). Above the dashed line = Senate Democrat did better.",
-    x = "Governor margin (Wilson R vs. Johnson D)",
-    y = "Senate margin (Graham R vs. Andrews D)",
-    caption = "Unofficial results. Source: S.C. Election Commission; USDA ERS 2023 RUCC."
+    title = "Governor swing by county: 2018 wave vs. 2026 wave",
+    subtitle = "Swing = change in Dem-minus-Rep margin. Above the dashed line = bigger shift toward Democrats in 2026.",
+    x = "2014 to 2018 swing (Haley vs. Sheheen to McMaster vs. Smith)",
+    y = "2022 to 2026 swing (McMaster vs. Cunningham to Wilson vs. Johnson)",
+    caption = "Official 2026 results. Source: S.C. Election Commission."
   ) +
   theme_minimal(base_size = 11) +
   theme(plot.title = element_text(face = "bold"),
         plot.caption = element_text(hjust = 0, color = "grey40"),
         panel.grid.minor = element_blank())
 
-split_scatter
-ggsave("output/split_ticket_scatter.png", split_scatter, width = 9, height = 8, dpi = 300, bg = "white")
+swing_scatter
 
-# ---- 6. Supporting chart: Senate swing vs governor swing, by county ----------
+# ---- 5. Chart 2: change in ballots cast, 2018 wave vs. 2026 wave -------------
 
-swing_long <- analysis |>
-  mutate(county = fct_reorder(county, senate_swing)) |>
-  select(county, county_type, senate_swing, gov_swing) |>
-  pivot_longer(c(senate_swing, gov_swing), names_to = "race", values_to = "swing") |>
-  mutate(race = recode(race, senate_swing = "Senate 2022 to 2026",
-                       gov_swing    = "Governor 2022 to 2026"))
+label_ballots <- waves |>
+  filter(rank(desc(ballots_2026)) <= 8 |
+           rank(desc(abs(ballots_change_2026 - ballots_change_2018))) <= 5)
 
-swing_dumbbell <- ggplot(swing_long, aes(x = swing, y = county)) +
-  geom_vline(xintercept = 0, color = "grey70") +
-  geom_line(aes(group = county), color = "grey75", linewidth = 0.8) +
-  geom_point(aes(color = race), size = 2.4) +
-  facet_grid(county_type ~ ., scales = "free_y", space = "free_y") +
+ballots_scatter <- ggplot(waves, aes(x = ballots_change_2018, y = ballots_change_2026)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
+  geom_point(aes(size = ballots_2026), shape = 21, fill = "#4A6FA5", color = "white", alpha = 0.8) +
+  geom_text_repel(data = label_ballots, aes(label = county), size = 3, min.segment.length = 0, seed = 1) +
   scale_x_continuous(labels = scales::label_percent(style_positive = "plus")) +
-  scale_color_manual(values = c("Senate 2022 to 2026" = "#2166AC",
-                                "Governor 2022 to 2026" = "#9E9AC8"),
-                     name = NULL) +
-  labs(
-    title = "Swing toward Democrats, 2022 to 2026, by county",
-    subtitle = "Change in margin (Dem share minus Rep share). Right of zero = moved toward the Democrat.",
-    x = "Swing in margin", y = NULL,
-    caption = "Unofficial 2026 results. Source: S.C. Election Commission; USDA ERS 2023 RUCC."
-  ) +
-  theme_minimal(base_size = 10) +
-  theme(plot.title = element_text(face = "bold"),
-        plot.caption = element_text(hjust = 0, color = "grey40"),
-        legend.position = "top",
-        strip.text.y = element_text(angle = 0, face = "bold"),
-        panel.grid.major.y = element_blank())
-
-swing_dumbbell
-ggsave("output/swing_dumbbell.png", swing_dumbbell, width = 8, height = 11, dpi = 300, bg = "white")
-
-# Swing vs college share
-swing_college <- analysis |>
-  select(county, county_type, college_share, votes_2026, senate_swing, gov_swing) |>
-  pivot_longer(c(senate_swing, gov_swing), names_to = "race", values_to = "swing") |>
-  mutate(race = recode(race, senate_swing = "Senate swing", gov_swing = "Governor swing")) |>
-  ggplot(aes(x = college_share, y = swing)) +
-  geom_hline(yintercept = 0, color = "grey70") +
-  geom_point(aes(size = votes_2026, fill = county_type), shape = 21, color = "white", alpha = 0.85) +
-  geom_smooth(method = "lm", se = FALSE, color = "grey30", linewidth = 0.6) +
-  facet_wrap(~race) +
-  scale_x_continuous(labels = scales::percent) +
   scale_y_continuous(labels = scales::label_percent(style_positive = "plus")) +
-  scale_size_area(max_size = 10, guide = "none") +
-  scale_fill_manual(values = c(Urban = "#4A6FA5", Suburban = "#E08E45", Rural = "#7A9A65"),
-                    name = NULL) +
-  labs(title = "Swing toward Democrats vs. college share",
-       x = "Adults 25+ with a bachelor's degree or higher (ACS 2019-2023)",
-       y = "Swing in margin, 2022 to 2026",
-       caption = "Unofficial 2026 results. Source: S.C. Election Commission; U.S. Census Bureau ACS.") +
+  scale_size_area(max_size = 12, labels = scales::comma, name = "2026 ballots") +
+  labs(
+    title = "Change in ballots cast by county: 2018 wave vs. 2026 wave",
+    subtitle = str_glue(
+      "Statewide: {scales::percent(statewide$ballots_change[statewide$year == '2018'], accuracy = 0.1, style_positive = 'plus')} ",
+      "from 2014 to 2018, {scales::percent(statewide$ballots_change[statewide$year == '2026'], accuracy = 0.1, style_positive = 'plus')} ",
+      "from 2022 to 2026. Above the dashed line = more growth in 2026."
+    ),
+    x = "Change in ballots cast, 2014 to 2018",
+    y = "Change in ballots cast, 2022 to 2026",
+    caption = "Official 2026 results. Source: S.C. Election Commission."
+  ) +
   theme_minimal(base_size = 11) +
   theme(plot.title = element_text(face = "bold"),
-        plot.caption = element_text(hjust = 0, color = "grey40"))
+        plot.caption = element_text(hjust = 0, color = "grey40"),
+        panel.grid.minor = element_blank())
 
-swing_college
-ggsave("output/swing_vs_college.png", swing_college, width = 10, height = 5, dpi = 300, bg = "white")
+ballots_scatter
+
+# ---- 6. Chart 3: statewide margin and ballots, four midterms -----------------
+
+statewide_long <- statewide |>
+  select(year, margin, ballots) |>
+  pivot_longer(c(margin, ballots), names_to = "measure", values_to = "value") |>
+  mutate(
+    label = if_else(measure == "margin",
+                    scales::percent(value, accuracy = 0.1, style_positive = "plus"),
+                    scales::comma(value, accuracy = 1)),
+    measure = recode(measure, margin = "Governor margin (Dem minus Rep)",
+                     ballots = "Total ballots cast"),
+    wave = if_else(year %in% c("2018", "2026"), "Wave year", "Year before")
+  )
+
+statewide_bars <- ggplot(statewide_long, aes(x = year, y = value, fill = wave)) +
+  geom_col(width = 0.65) +
+  geom_text(aes(label = label, vjust = if_else(value < 0, 1.4, -0.5)), size = 3.3) +
+  facet_wrap(~measure, scales = "free_y") +
+  scale_y_continuous(expand = expansion(mult = 0.15), labels = NULL) +
+  scale_fill_manual(values = c("Wave year" = "#2F4B7C", "Year before" = "#B8B8B8"), name = NULL) +
+  labs(
+    title = "South Carolina governor races, four midterms",
+    x = NULL, y = NULL,
+    caption = "Official 2026 results. Source: S.C. Election Commission."
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"),
+        plot.caption = element_text(hjust = 0, color = "grey40"),
+        strip.text = element_text(face = "bold"),
+        legend.position = "top",
+        panel.grid = element_blank())
+
+statewide_bars
+
+
 ```
