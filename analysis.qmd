@@ -12,6 +12,7 @@ library(readxl)
 library(stringr)
 library(sf)
 library(tigris)
+options(tigris_use_cache = TRUE)
 library(scales)
 library(patchwork)
 library(tidygeocoder)
@@ -166,6 +167,312 @@ cells_2026 |>
   left_join(names_2026, by = c("race", "row")) |>
   mutate(county = if_else(county == "Total:", "South Carolina", county)) |>
   left_join(registration_2026, by = "county") |>
-  filter(as.numeric(value) != registered)          # expect 0 rows
+  filter(as.numeric(value) != registered)        
+```
+
+```{r}
+# make comparison maps to see shifts in rep/dem leaning across counties in midterms
+
+race_order <- c("2022 Senate", "2022 Governor", "2026 Governor", "2026 Senate")
+
+# read all 4 races into a long table
+
+files <- c(
+  "2022 Senate"   = "data/2022_senate.csv",
+  "2022 Governor" = "data/2022_gov.csv"
+)
+
+raw <- files |>
+  map(\(f) read_csv(f, col_names = FALSE, col_types = cols(.default = "c"))) |>
+  list_rbind(names_to = "race") |>
+  group_by(race) |>
+  mutate(row = row_number()) |>
+  ungroup()
+
+column_labels <- raw |>
+  filter(row %in% 1:2) |>
+  pivot_longer(-c(race, row, X1, X2), names_to = "col", values_to = "value") |>
+  select(race, row, col, value) |>
+  pivot_wider(names_from = row, values_from = value, names_prefix = "row") |>
+  rename(candidate = row1, party = row2) |>
+  filter(!is.na(candidate))
+
+results <- raw |>
+  filter(X1 %in% c("State", "County")) |>
+  rename(level = X1, county = X2) |>
+  pivot_longer(-c(race, row, level, county), names_to = "col", values_to = "votes") |>
+  inner_join(column_labels, by = c("race", "col")) |>
+  mutate(votes = as.numeric(votes)) |>
+  select(race, level, county, candidate, party, votes)
+
+# 2026: reshape the cleaned data frames from 01 the same way and stack them on
+results_2026 <- bind_rows("2026 Governor" = governor_2026,
+                          "2026 Senate"   = senate_2026, .id = "race") |>
+  pivot_longer(-c(race, level, county), names_to = "candidate",
+               values_to = "votes", values_drop_na = TRUE) |>
+  mutate(party = str_extract(candidate, "(?<=\\()[^)]+(?=\\)$)"))   # "(Democratic)" -> Democratic
+
+results <- bind_rows(results, results_2026)
+
+# 2 party dem share by county
+
+vote_shares <- results |>
+  group_by(race, level, county) |>
+  summarize(
+    dem_votes = sum(votes[party %in% "Democratic"]),
+    rep_votes = sum(votes[party %in% "Republican"]),
+    total_votes = sum(votes[candidate == "Total Votes Cast"]),
+    .groups = "drop"
+  ) |>
+  mutate(dem_share = dem_votes/total_votes, 
+         rep_share = rep_votes/total_votes,
+         margin = dem_share - rep_share,
+         race = factor(race, levels = race_order))
+
+vote_shares |> filter(level=="State")
+ 
+
+# ---- 3. County shapes and the join -------------------------------------------
+# Census cartographic boundary file (generalized, clipped to the shoreline).
+# Join on county name after lower-casing and dropping spaces/punctuation,
+# so "McCormick" / "Mccormick" or "St. X" style differences can't break it.
+
+sc_counties <- counties(state = "SC", cb = TRUE, year = 2024) |>
+  select(GEOID, NAME, geometry) |>
+  mutate(county_key = str_to_lower(str_remove_all(NAME, "[^A-Za-z]")))
+
+map_data <- vote_shares |>
+  filter(level == "County") |>
+  mutate(county_key = str_to_lower(str_remove_all(county, "[^A-Za-z]")))
+
+# Any county in the results with no shape (expect 0 rows), and vice versa
+anti_join(map_data, st_drop_geometry(sc_counties), by = "county_key")
+anti_join(st_drop_geometry(sc_counties), distinct(map_data, county_key), by = "county_key")
+
+map_data <- sc_counties |>
+  inner_join(map_data, by = "county_key")
+
+# 46 counties in each of the 4 races
+map_data |> st_drop_geometry() |> count(race)
+stopifnot(nrow(map_data) == 46 * 4, n_distinct(map_data$GEOID) == 46)
+
+# ---- 4. Maps -----------------------------------------------------------------
+# Diverging red-white-blue centered at 50%. The same limits are used on every
+# map so a given shade means the same share in every race.
+
+margin_limit <- max(abs(map_data$margin))
+
+share_fill <- scale_fill_gradient2(
+  low = "#B2182B", mid = "#F7F7F7", high = "#2166AC", midpoint = 0,
+  limits = c(-margin_limit, margin_limit),
+  labels = scales::label_percent(style_positive = "plus"),
+  name = "Dem share minus\nRep share"
+)
+
+# All four races on one page
+four_panel <- ggplot(map_data) +
+  geom_sf(aes(fill = margin), color = "white", linewidth = 0.2) +
+  share_fill +
+  facet_wrap(~race, ncol = 2) +
+  labs(
+    title = "South Carolina: Democratic minus Republican vote share by county",
+    caption = "Shares are of all votes cast in the race, including third parties and write-ins. 2026 results are unofficial.\nSource: S.C. Election Commission; county boundaries: U.S. Census Bureau (tigris)."
+  ) +
+  theme_void(base_size = 11) +
+  theme(strip.text = element_text(face = "bold", size = 11),
+        plot.title = element_text(face = "bold"),
+        plot.caption = element_text(hjust = 0, color = "grey40"),
+        legend.position = "right")
+
+four_panel
+
+# One PNG per race
+map_2022_senate <- ggplot(filter(map_data, race == "2022 Senate")) +
+  geom_sf(aes(fill = margin), color = "white", linewidth = 0.2) +
+  share_fill +
+  labs(title = "2022 U.S. Senate: Scott (R) vs. Matthews (D)",
+       caption = "Source: S.C. Election Commission; U.S. Census Bureau.") +
+  theme_void() +
+  theme(plot.title = element_text(face = "bold"),
+        plot.caption = element_text(hjust = 0, color = "grey40"))
+
+map_2022_governor <- ggplot(filter(map_data, race == "2022 Governor")) +
+  geom_sf(aes(fill = margin), color = "white", linewidth = 0.2) +
+  share_fill +
+  labs(title = "2022 Governor: McMaster (R) vs. Cunningham (D)",
+       caption = "Source: S.C. Election Commission; U.S. Census Bureau.") +
+  theme_void() +
+  theme(plot.title = element_text(face = "bold"),
+        plot.caption = element_text(hjust = 0, color = "grey40"))
+
+map_2026_governor <- ggplot(filter(map_data, race == "2026 Governor")) +
+  geom_sf(aes(fill = margin), color = "white", linewidth = 0.2) +
+  share_fill +
+  labs(title = "2026 Governor: Wilson (R) vs. Johnson (D)",
+       caption = "Unofficial results. Source: S.C. Election Commission; U.S. Census Bureau.") +
+  theme_void() +
+  theme(plot.title = element_text(face = "bold"),
+        plot.caption = element_text(hjust = 0, color = "grey40"))
+
+map_2026_senate <- ggplot(filter(map_data, race == "2026 Senate")) +
+  geom_sf(aes(fill = margin), color = "white", linewidth = 0.2) +
+  share_fill +
+  labs(title = "2026 U.S. Senate: Graham (R) vs. Andrews (D)",
+       caption = "Unofficial results. Source: S.C. Election Commission; U.S. Census Bureau.") +
+  theme_void() +
+  theme(plot.title = element_text(face = "bold"),
+        plot.caption = element_text(hjust = 0, color = "grey40"))
+
+map_2022_senate
+map_2022_governor
+map_2026_senate
+map_2026_governor
+```
+
+```{r}
+
+# summary statistics on voter turnout
+
+race_order <- c("2020 President", "2020 Senate", "2022 Governor", "2022 Senate",
+                "2024 President", "2026 Governor", "2026 Senate")
+
+files <- c(
+  "2020 President" = "data/2020_pres.csv",
+  "2020 Senate"    = "data/2020_senate.csv",
+  "2022 Governor"  = "data/2022_gov.csv",
+  "2022 Senate"    = "data/2022_senate.csv",
+  "2024 President" = "data/2024_pres.csv"
+)
+
+# read every race into a very long table
+
+raw <- files |>
+  map(\(f) read_csv(f, col_names = FALSE, col_types = cols(.default = "c"))) |>
+  list_rbind(names_to = "race") |>
+  group_by(race) |>
+  mutate(row = row_number()) |>
+  ungroup()
+
+column_labels <- raw |>
+  filter(row == 1) |>
+  pivot_longer(-c(race, row, X1, X2), names_to = "col", values_to = "candidate") |>
+  filter(!is.na(candidate)) |>
+  select(race, col, candidate)
+
+results <- raw |>
+  filter(X1 %in% c("State", "County")) |>
+  rename(level = X1, county = X2) |>
+  pivot_longer(-c(race, row, level, county), names_to = "col", values_to = "votes") |>
+  inner_join(column_labels, by = c("race", "col")) |>
+  mutate(votes = as.numeric(votes)) |>
+  select(race, level, county, candidate, votes)
+
+results_2026 <- bind_rows("2026 Governor" = governor_2026,
+                          "2026 Senate"   = senate_2026, .id = "race") |>
+  pivot_longer(-c(race, level, county), names_to = "candidate",
+               values_to = "votes", values_drop_na = TRUE)
+
+results <- bind_rows(results, results_2026)
+
+totals <- results |>
+  filter(candidate %in% c("Total Votes Cast",
+                          "Overvotes/Undervotes",
+                          "Total Ballots Cast")) |>
+  select(race, level, county, candidate, votes) |>
+  pivot_wider(names_from = candidate, values_from = votes) |>
+  rename(votes_cast = `Total Votes Cast`, over_under = `Overvotes/Undervotes`,
+         ballots = `Total Ballots Cast`)
+
+# Candidate votes sum to Total Votes Cast
+results |>
+  filter(!candidate %in% c("Total Votes Cast", "Overvotes/Undervotes", "Total Ballots Cast")) |>
+  group_by(race, level, county) |>
+  summarise(sum_of_candidates = sum(votes), .groups = "drop") |>
+  left_join(totals, by = c("race", "level", "county")) |>
+  filter(sum_of_candidates != votes_cast)
+
+# Votes + over/undervotes = ballots
+totals |> filter(votes_cast + over_under != ballots)
+
+# County rows sum to the State row
+totals |>
+  group_by(race, level) |>
+  summarise(ballots = sum(ballots), .groups = "drop") |>
+  pivot_wider(names_from = level, values_from = ballots) |>
+  filter(County != State)
+
+# Same-year races should report the same ballots cast in each county
+totals |>
+  mutate(year = str_sub(race, 1, 4)) |>
+  group_by(year, county) |>
+  summarise(n_values = n_distinct(ballots), min = min(ballots), max = max(ballots),
+            .groups = "drop") |>
+  filter(n_values > 1)
+
+# ---- 3. Turnout summary by race ----------------------------------------------
+
+turnout_by_county <- totals |>
+  filter(level == "County") |>
+  left_join(select(registration_2026, county, registered), by = "county") |>
+  mutate(
+    registered    = if_else(str_starts(race, "2026"), registered, NA),
+    turnout_rate  = ballots / registered,
+    roll_off_rate = over_under / ballots     # ballots that skipped (or spoiled) this race
+  )
+
+turnout_summary <- turnout_by_county |>
+  group_by(race) |>
+  summarise(
+    statewide_ballots       = sum(ballots),
+    statewide_votes_in_race = sum(votes_cast),
+    statewide_roll_off      = sum(over_under) / sum(ballots),
+    county_ballots_median   = median(ballots),
+    county_ballots_min      = min(ballots),
+    county_ballots_max      = max(ballots),
+    statewide_registered    = sum(registered),
+    statewide_turnout_rate  = sum(ballots) / sum(registered),
+    county_turnout_median   = median(turnout_rate),
+    county_turnout_min      = min(turnout_rate),
+    county_turnout_max      = max(turnout_rate)
+  ) |>
+  mutate(race = factor(race, levels = race_order)) |>
+  arrange(race)
+
+turnout_summary |> print(width = Inf)
+
+# Highest and lowest 2026 turnout counties
+turnout_by_county |>
+  filter(race == "2026 Senate") |>
+  select(county, registered, ballots, turnout_rate) |>
+  arrange(desc(turnout_rate)) |>
+  slice(c(1:5, 42:46))
+
+# Ballots cast change by county, 2022 -> 2026 (both midterms)
+ballots_change <- turnout_by_county |>
+  filter(race %in% c("2022 Senate", "2026 Senate")) |>
+  mutate(year = str_sub(race, 1, 4)) |>
+  select(county, year, ballots) |>
+  pivot_wider(names_from = year, values_from = ballots, names_prefix = "ballots_") |>
+  mutate(pct_change = ballots_2026 / ballots_2022 - 1) |>
+  arrange(desc(pct_change))
+
+ballots_change
+
+# Chart: statewide ballots cast by race
+turnout_chart <- turnout_summary |>
+  ggplot(aes(x = race, y = statewide_ballots)) +
+  geom_col(fill = "#4A6FA5", width = 0.65) +
+  geom_text(aes(label = scales::comma(statewide_ballots)), vjust = -0.5, size = 3.3) +
+  scale_y_continuous(labels = scales::label_number(scale = 1e-6, suffix = "M"),
+                     expand = expansion(mult = c(0, 0.1))) +
+  labs(title = "South Carolina: total ballots cast, 2020-2026",
+       x = NULL, y = "Ballots cast",
+       caption = "2026 results are unofficial. Source: S.C. Election Commission.") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.major.x = element_blank(),
+        plot.title = element_text(face = "bold"),
+        plot.caption = element_text(hjust = 0, color = "grey40"))
+
+turnout_chart
 
 ```
